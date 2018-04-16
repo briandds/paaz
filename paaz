@@ -1,0 +1,67 @@
+#!/usr/bin/env perl
+
+use Mojolicious::Lite;
+use Mojo::File qw/tempdir path/;
+use Mojo::JSON qw/decode_json/;
+use experimental 'signatures';
+
+# Configuration
+my $config = plugin 'Config';
+my $app_name = $config->{app_name} || 'app.pl';
+my $container = $config->{container_name} || die "missing container name";
+app->mode($config->{server_mode}) if $config->{server_mode};
+app->log->path($config->{log_path}) if $config->{log_path};
+
+app->log->debug("Starting pazz, app: $app_name, container: $container");
+
+# Helper function
+# NB: this could be replaced with a git pull perhaps
+sub pull_branch($prefix,$branch,$commit) {
+    my $json = `rack files object list --container $container --output json`;
+    my $dir = tempdir( UNLINK => 0);
+    my $data = decode_json($json);
+    for (@$data) {
+        my $path = path($dir)->child($_->{Name});
+        my $contents = `rack files object download --container $container --name $_->{Name}`;
+        $path->dirname->make_path;
+        $path->spurt($contents);
+    }
+    chomp( my $travis_branch = $dir->child('travis-branch')->slurp );
+    chomp( my $travis_commit = $dir->child('travis-commit')->slurp );
+    return 0 unless $travis_branch eq $branch;
+    return 0 unless $travis_commit eq $commit;
+
+    my $destination_dir = path($prefix)->child($travis_branch);
+    if (-e "$destination_dir") {
+       rename "$destination_dir", "/tmp/$travis_branch";
+    }
+    $dir->move_to($destination_dir);
+    app->log->info("wrote $destination_dir");
+    path("/tmp/$travis_branch")->remove_tree;
+}
+
+# Routes
+get '/' => { text => 'nothing to see here' };
+
+# Deploy the container, hot restart the server.
+post '/deploy/:commit/:branch' => sub($c) {
+    my $branch = $c->stash('branch');
+    my $commit = $c->stash('commit');
+    pull_branch('./dev/run',$branch,$commit)
+        or return $c->render(text => "Failed to deploy $branch ($commit)");
+    $c->render( text => "Deployed $branch ($commit)" );
+    my $pid = path('hypnotoad.pid')->slurp;
+    kill 'SIGUSR2', $pid;
+};
+
+# Review apps with directories named after branches.
+for my $path (path('./dev/run/')->list({dir => 1})->each) {
+    my $branch = $path->basename;
+    app->log->info("Found review app: $branch");
+    my $mounted = plugin Mount => { "/$branch" => "./dev/run/$branch/$app_name" };
+    my $app = $mounted->pattern->defaults->{app};
+    $app->log->path("$branch.log");
+    $app->mode('development');
+}
+
+app->start;
