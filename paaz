@@ -61,7 +61,6 @@ for my $path (path('./dev/run/')->list({dir => 1})->each) {
     my $mounted = plugin Mount => { "/$branch" => "./dev/run/$branch/$app_name" };
     my $app = $mounted->pattern->defaults->{app};
     $app->log->path("$branch.log");
-    $app->mode('development');
 }
 
 app->start;
