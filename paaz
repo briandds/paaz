@@ -33,9 +33,9 @@ sub start_server($branch) {
   if (my $pid = delete $running{$branch}) {
     app->log->debug("Stopping pid $pid for $branch");
     kill 'TERM', $pid;
-    sleep 0;
+    sleep 2;
     if (kill 0, $pid) {
-      kill 9, $pid;
+      app->log->debug("Server $pid for $branch did not stop.");
     }
     delete $ports{$branch};
   }
@@ -98,15 +98,17 @@ get '/' => {text => 'nothing to see here'};
 post '/deploy/:commit/:branch' => sub($c) {
   my $branch = $c->stash('branch');
   my $commit = $c->stash('commit');
-  pull_branch($mirror_dir, $branch, $commit)
-    or return $c->render(text => "Failed to deploy $branch ($commit)");
-  $c->render(text => "Deployed $branch ($commit)");
+  Mojo::IOLoop->subprocess(sub {
+     pull_branch($mirror_dir, $branch, $commit) or app->log->error("Error deploying $branch $commit");
+  });
+  $c->render(text => "Deploying $branch ($commit)");
 };
 
 any '/:branch/*rest' => {rest => ''} => sub($c) {
   my $branch = $c->stash('branch');
   return $c->reply->not_found unless -d path($mirror_dir)->child($branch) . '';
   start_server($branch) unless $running{$branch};
+  $c->app->log->debug("Proxying to $branch at $ports{$branch}");
   my $proxy =
     Mojo::UserAgent::Proxy->new->http("http://localhost:$ports{$branch}");
   my $ua  = $c->ua->proxy($proxy);
