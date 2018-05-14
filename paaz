@@ -4,63 +4,133 @@ use Mojolicious::Lite;
 use Mojo::File qw/tempdir path/;
 use Mojo::JSON qw/decode_json/;
 use experimental 'signatures';
+use Cwd;
 
 # Configuration
-my $config = plugin 'Config';
-my $app_name = $config->{app_name} || 'app.pl';
-my $container = $config->{container_name} || die "missing container name";
-app->mode($config->{server_mode}) if $config->{server_mode};
+my $config     = plugin 'Config';
+my $app_name   = $config->{app_name} || 'app.pl';
+my $mirror_dir = $config->{mirror_dir} || "./dev/run";
+my $container  = $config->{container_name} || die "missing container name";
+app->mode($config->{server_mode})   if $config->{server_mode};
 app->log->path($config->{log_path}) if $config->{log_path};
+app->log->debug("Starting paaz, app: $app_name, container: $container");
+app->secrets($config->{secrets}) if $config->{secrets};
 
-app->log->debug("Starting pazz, app: $app_name, container: $container");
+# Get a free port
+sub get_port {
+  state $port = 10_000;
+  return $port++;
+}
 
-# Helper function
-# NB: this could be replaced with a git pull perhaps
-sub pull_branch($prefix,$branch,$commit) {
-    my $json = `rack files object list --container $container --output json`;
-    my $dir = tempdir( UNLINK => 0);
-    my $data = decode_json($json);
-    for (@$data) {
-        my $path = path($dir)->child($_->{Name});
-        my $contents = `rack files object download --container $container --name $_->{Name}`;
-        $path->dirname->make_path;
-        $path->spurt($contents);
+# Ports in use
+my %ports;
+
+# Subprocesses
+my %running;
+
+# Start a new server.
+sub start_server($branch) {
+  if (my $pid = delete $running{$branch}) {
+    app->log->debug("Stopping pid $pid for $branch");
+    kill 'TERM', $pid;
+    sleep 2;
+    if (kill 0, $pid) {
+      app->log->debug("Server $pid for $branch did not stop.");
     }
-    chomp( my $travis_branch = $dir->child('travis-branch')->slurp );
-    chomp( my $travis_commit = $dir->child('travis-commit')->slurp );
-    return 0 unless $travis_branch eq $branch;
-    return 0 unless $travis_commit eq $commit;
+    delete $ports{$branch};
+  }
+  app->log->debug("Starting server for $branch");
+  my $port = get_port;
+  $ports{$branch} = $port;
+  my $cwd = getcwd();
+  chdir "$mirror_dir/$branch" or do {
+    app->log->error("could not find directory $branch");
+    chdir $cwd;
+    return;
+  };
+  mkdir 'log';
+  my @cmd = ("./$app_name");
+  unless (-x "$app_name") {
+    unshift @cmd, "perl";
+  }
+  my $pid = fork;
+  if ($pid == 0) {
+    exec @cmd, "daemon", "-l", "http://localhost:$port";
+  }
+  $running{$branch} = $pid;
+  app->log->debug("Started $branch (" . $pid . ") on port $port");
+  chdir $cwd;
+}
 
-    my $destination_dir = path($prefix)->child($travis_branch);
-    if (-e "$destination_dir") {
-       rename "$destination_dir", "/tmp/$travis_branch";
-    }
-    $dir->move_to($destination_dir);
-    app->log->info("wrote $destination_dir");
-    path("/tmp/$travis_branch")->remove_tree;
+#
+# pull_branch: Could be replaced with a git pull perhaps.
+#
+sub pull_branch ($prefix, $branch, $commit) {
+  my $json = `rack files object list --container $container --output json`;
+  my $dir  = tempdir(UNLINK => 0);
+  my $data = decode_json($json);
+  for (@$data) {
+    my $path = path($dir)->child($_->{Name});
+    my $contents =
+      `rack files object download --container $container --name $_->{Name}`;
+    $path->dirname->make_path;
+    $path->spurt($contents);
+  }
+  chomp(my $travis_branch = $dir->child('travis-branch')->slurp);
+  chomp(my $travis_commit = $dir->child('travis-commit')->slurp);
+  return 0 unless $travis_branch eq $branch;
+  return 0 unless $travis_commit eq $commit;
+
+  my $destination_dir = path($prefix)->child($travis_branch);
+  if (-e "$destination_dir") {
+    rename "$destination_dir", "/tmp/$travis_branch";
+  }
+  $dir->move_to($destination_dir);
+  app->log->info("wrote $destination_dir");
+  path("/tmp/$travis_branch")->remove_tree;
+  start_server($branch);
 }
 
 # Routes
-get '/' => { text => 'nothing to see here' };
+get '/' => {text => 'nothing to see here'};
 
 # Deploy the container, hot restart the server.
 post '/deploy/:commit/:branch' => sub($c) {
-    my $branch = $c->stash('branch');
-    my $commit = $c->stash('commit');
-    pull_branch('./dev/run',$branch,$commit)
-        or return $c->render(text => "Failed to deploy $branch ($commit)");
-    $c->render( text => "Deployed $branch ($commit)" );
-    my $pid = path('hypnotoad.pid')->slurp;
-    kill 'SIGUSR2', $pid;
+  my $branch = $c->stash('branch');
+  my $commit = $c->stash('commit');
+  Mojo::IOLoop->subprocess(sub {
+     pull_branch($mirror_dir, $branch, $commit) or app->log->error("Error deploying $branch $commit");
+  });
+  $c->render(text => "Deploying $branch ($commit)");
 };
 
-# Review apps with directories named after branches.
-for my $path (path('./dev/run/')->list({dir => 1})->each) {
-    my $branch = $path->basename;
-    app->log->info("Found review app: $branch");
-    my $mounted = plugin Mount => { "/$branch" => "./dev/run/$branch/$app_name" };
-    my $app = $mounted->pattern->defaults->{app};
-    $app->log->path("$branch.log");
-}
+any '/:branch/*rest' => {rest => ''} => sub($c) {
+  my $branch = $c->stash('branch');
+  return $c->reply->not_found unless -d path($mirror_dir)->child($branch) . '';
+  start_server($branch) unless $running{$branch};
+  $c->app->log->debug("Proxying to $branch at $ports{$branch}");
+  my $proxy =
+    Mojo::UserAgent::Proxy->new->http("http://localhost:$ports{$branch}");
+  my $ua  = $c->ua->proxy($proxy);
+  my $url = $c->req->url->clone;
+  shift @{$url->path->parts};
+  my $tx = $ua->build_tx($c->req->method => $url);
+  $tx->req->url($url);
+  $tx->req->body($c->req->body);
+
+  if (my $type = $c->req->headers->content_type) {
+    $tx->req->headers->content_type($type);
+  }
+  $tx->req->headers->add('X-Forwarded-Base', "/$branch");
+  $tx = $ua->start($tx);
+
+  if (my $res = $tx->success) {
+    $c->tx->res($res);
+    $c->rendered;
+  }
+  else {
+    $c->render(text => 'error' . $c->dumper($tx->error));
+  }
+};
 
 app->start;

@@ -1,2 +1,4 @@
 paaz.conf
 *.log
+*.bak
+dev/
